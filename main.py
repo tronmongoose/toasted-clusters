@@ -12,20 +12,20 @@ Writes to $OBSIDIAN_VAULT/$OBSIDIAN_MEETINGS_SUBDIR/ (defaults to ~/vault/meetin
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 from dotenv import load_dotenv
 
-from audio import transcribe_audio_chunked, validate_audio
+from audio import probe_duration, transcribe_audio_chunked, validate_audio
 from finance_guard import contains_financial_data
-from transcribe import get_transcriber
 from wikilinks import inject as inject_wikilinks
 
 load_dotenv()
@@ -76,7 +76,6 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     text = transcribe_audio_chunked(wav)
     print(text)
     if args.write:
-        from audio import probe_duration
         path = _obsidian_write(text, duration_sec=int(probe_duration(wav)), source=str(src))
         print(f"wrote: {path}", file=sys.stderr)
     return 0
@@ -108,79 +107,129 @@ def _resolve_mic(explicit: str | None) -> str | int | None:
     return None
 
 
-def _capture_dual(
+def _capture_streaming(
     system_device: str,
     mic_device: str | int | None,
     seconds: int,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
-) -> tuple[np.ndarray, int]:
-    """Capture system audio and (optionally) the mic in parallel; mix to mono.
+) -> tuple[Path, Path | None]:
+    """Stream system audio (and optionally mic) to temp WAV files as they arrive.
 
-    Two independent InputStreams write into preallocated float32 buffers via
-    callbacks, then we sum the buffers with 0.7x gain on each side so the
-    mix doesn't clip when both sides are loud. If `mic_device` is None we
-    skip mic capture and just return the system-audio buffer.
+    Each sd.InputStream callback writes its block straight to its own
+    soundfile.SoundFile (16 kHz mono PCM_16). SIGINT/SIGTERM finalize the
+    files cleanly via a threading.Event, so a partial recording survives
+    Ctrl-C, kill, or crash. Returns (sys_wav_path, mic_wav_path) — mic path
+    is None when mic capture is disabled or fails to open.
     """
     import sounddevice as sd
+    import soundfile as sf
 
-    frames_total = int(seconds * sample_rate)
-    sys_buf = np.zeros(frames_total, dtype=np.float32)
-    mic_buf = np.zeros(frames_total, dtype=np.float32) if mic_device is not None else None
-    sys_idx = 0
-    mic_idx = 0
+    sys_tmp = tempfile.NamedTemporaryFile(prefix="toasted-clusters-sys-", suffix=".wav", delete=False)
+    sys_tmp.close()
+    sys_path = Path(sys_tmp.name)
 
-    def _mono(block: np.ndarray) -> np.ndarray:
-        return block.mean(axis=1) if block.ndim > 1 and block.shape[1] > 1 else block.reshape(-1)
+    mic_path: Path | None = None
+    if mic_device is not None:
+        mic_tmp = tempfile.NamedTemporaryFile(prefix="toasted-clusters-mic-", suffix=".wav", delete=False)
+        mic_tmp.close()
+        mic_path = Path(mic_tmp.name)
 
-    def sys_cb(indata, _frames, _time, _status):
-        nonlocal sys_idx
-        chunk = _mono(indata)
-        end = min(sys_idx + len(chunk), frames_total)
-        sys_buf[sys_idx:end] = chunk[: end - sys_idx]
-        sys_idx = end
-
-    def mic_cb(indata, _frames, _time, _status):
-        nonlocal mic_idx
-        chunk = _mono(indata)
-        end = min(mic_idx + len(chunk), frames_total)
-        mic_buf[mic_idx:end] = chunk[: end - mic_idx]
-        mic_idx = end
-
-    print(f"Capturing {seconds}s — system='{system_device}'"
+    print(f"Capturing up to {seconds}s — system='{system_device}'"
           + (f" + mic={mic_device!r}" if mic_device is not None else " (no mic)")
           + f" at {sample_rate} Hz…", file=sys.stderr)
+    print(f"  → streaming to {sys_path}"
+          + (f" + {mic_path}" if mic_path else "")
+          + " (survives stop/crash)", file=sys.stderr)
 
-    sys_stream = sd.InputStream(
-        device=system_device, channels=2, samplerate=sample_rate,
-        dtype="float32", callback=sys_cb,
-    )
-    streams = [sys_stream]
-    if mic_device is not None:
-        try:
-            mic_stream = sd.InputStream(
-                device=mic_device, channels=1, samplerate=sample_rate,
-                dtype="float32", callback=mic_cb,
-            )
-            streams.append(mic_stream)
-        except sd.PortAudioError as e:
-            print(f"  warning: mic capture failed ({e}); recording system audio only",
-                  file=sys.stderr)
-            mic_device = None
-            mic_buf = None
+    stop = threading.Event()
 
-    for s in streams:
-        s.start()
+    def _on_stop(signum, _frame):
+        print(f"  ↳ signal {signum} received; finalizing capture…", file=sys.stderr)
+        stop.set()
+
+    prev_int = signal.signal(signal.SIGINT, _on_stop)
+    prev_term = signal.signal(signal.SIGTERM, _on_stop)
+
+    sys_wav = sf.SoundFile(str(sys_path), mode="w", samplerate=sample_rate,
+                           channels=1, subtype="PCM_16")
+    mic_wav: "sf.SoundFile | None" = None
+    if mic_path is not None:
+        mic_wav = sf.SoundFile(str(mic_path), mode="w", samplerate=sample_rate,
+                               channels=1, subtype="PCM_16")
+
+    def sys_cb(indata, _frames, _time, status):
+        if status:
+            print(f"  sys audio status: {status}", file=sys.stderr)
+        mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
+        sys_wav.write(mono.copy())
+
+    def mic_cb(indata, _frames, _time, status):
+        if status:
+            print(f"  mic audio status: {status}", file=sys.stderr)
+        mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
+        mic_wav.write(mono.copy())  # type: ignore[union-attr]
+
     try:
-        sd.sleep(int(seconds * 1000))
-    finally:
-        for s in streams:
-            s.stop()
-            s.close()
+        sys_stream = sd.InputStream(
+            samplerate=sample_rate, channels=2, dtype="float32",
+            device=system_device, callback=sys_cb,
+        )
+        streams = [sys_stream]
 
-    if mic_buf is None:
-        return sys_buf, sample_rate
-    mixed = np.clip(sys_buf * 0.7 + mic_buf * 0.7, -1.0, 1.0).astype(np.float32)
-    return mixed, sample_rate
+        if mic_path is not None:
+            try:
+                mic_stream = sd.InputStream(
+                    samplerate=sample_rate, channels=1, dtype="float32",
+                    device=mic_device, callback=mic_cb,
+                )
+                streams.append(mic_stream)
+            except sd.PortAudioError as e:
+                print(f"  warning: mic capture failed ({e}); recording system audio only",
+                      file=sys.stderr)
+                if mic_wav is not None:
+                    mic_wav.close()
+                    mic_wav = None
+                try:
+                    mic_path.unlink()
+                except OSError:
+                    pass
+                mic_path = None
+
+        try:
+            for s in streams:
+                s.start()
+            stop.wait(timeout=seconds)
+        finally:
+            for s in streams:
+                try:
+                    s.stop()
+                    s.close()
+                except sd.PortAudioError:
+                    pass
+    finally:
+        sys_wav.close()
+        if mic_wav is not None:
+            mic_wav.close()
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+
+    return sys_path, mic_path
+
+
+def _mix_streams(sys_wav: Path, mic_wav: Path, sample_rate: int = DEFAULT_SAMPLE_RATE) -> Path:
+    """Mix two mono WAVs via ffmpeg amix at 0.7x each (matches prior in-Python balance)."""
+    mixed_tmp = tempfile.NamedTemporaryFile(prefix="toasted-clusters-mixed-", suffix=".wav", delete=False)
+    mixed_tmp.close()
+    mixed_path = Path(mixed_tmp.name)
+    subprocess.run(
+        ["ffmpeg", "-y",
+         "-i", str(sys_wav), "-i", str(mic_wav),
+         "-filter_complex", "[0:a][1:a]amix=inputs=2:weights=0.7 0.7",
+         "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
+         str(mixed_path)],
+        capture_output=True, check=True, timeout=600,
+    )
+    return mixed_path
 
 
 def cmd_record(args: argparse.Namespace) -> int:
@@ -188,9 +237,33 @@ def cmd_record(args: argparse.Namespace) -> int:
     if mic_device is None and not args.no_mic:
         print("  warning: no usable mic device found; recording system audio only",
               file=sys.stderr)
-    audio_buf, sr = _capture_dual(args.device, mic_device, args.seconds)
-    transcriber = get_transcriber()
-    text = asyncio.run(transcriber.transcribe(audio_buf, sr))
+
+    sys_wav, mic_wav = _capture_streaming(args.device, mic_device, args.seconds)
+
+    if mic_wav is None:
+        final_wav = sys_wav
+    else:
+        final_wav = _mix_streams(sys_wav, mic_wav)
+
+    duration = probe_duration(final_wav)
+    print(f"  captured {duration:.1f}s; transcribing…", file=sys.stderr)
+
+    text = transcribe_audio_chunked(final_wav)
+
+    # Cleanup temp WAVs only after transcription succeeds — on a crash earlier,
+    # the source files in /var/folders/ are recoverable via
+    # `python main.py transcribe <path>`.
+    cleanup_paths: list[Path] = []
+    if final_wav != sys_wav:
+        cleanup_paths.append(final_wav)
+    cleanup_paths.append(sys_wav)
+    if mic_wav is not None:
+        cleanup_paths.append(mic_wav)
+    for p in cleanup_paths:
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
     if not text.strip():
         print("(empty transcript — nothing to write)", file=sys.stderr)
@@ -202,7 +275,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         print("(--no-write set; skipping vault write)", file=sys.stderr)
         return 0
 
-    path = _obsidian_write(text, duration_sec=args.seconds, source=f"audio:{args.device}")
+    path = _obsidian_write(text, duration_sec=int(duration), source=f"audio:{args.device}")
     print(f"wrote: {path}", file=sys.stderr)
     return 0
 
