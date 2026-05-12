@@ -1,0 +1,39 @@
+# Whisper MLX model cache (large — never commit)
+mlx_models/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Environment / secrets
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Media (so test fixtures or accidental drops don't get committed)
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.m4a
+*.aac
+*.flac
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/

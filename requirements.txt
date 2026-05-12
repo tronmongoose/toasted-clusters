@@ -1,0 +1,14 @@
+# Toasted Clusters — Apple-Silicon-only meeting transcriber
+
+# Core
+sounddevice>=0.4.6
+soundfile>=0.12
+numpy>=1.26
+python-dotenv>=1.0
+
+# STT (Apple Silicon MLX)
+lightning-whisper-mlx>=0.0.10
+
+# Optional: cloud STT fallback (TRANSCRIBER_MODE=cloud)
+# Uncomment if you want a Deepgram-backed mode.
+# deepgram-sdk>=3.0

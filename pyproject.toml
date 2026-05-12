@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toasted-clusters"
+version = "0.1.0"
+description = "Local, private meeting transcriber for macOS: system audio → Whisper MLX → Obsidian markdown with auto-wikilinks."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "tronmongoose" }]
+keywords = ["transcription", "whisper", "meetings", "obsidian", "mlx", "apple-silicon", "privacy", "local-first"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: MacOS X",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "Topic :: Office/Business",
+]
+dependencies = [
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    "python-dotenv>=1.0",
+    "lightning-whisper-mlx>=0.0.10",
+]
+
+[project.optional-dependencies]
+cloud = ["deepgram-sdk>=3.0"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+toasted-clusters = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/tronmongoose/toasted-clusters"
+Issues = "https://github.com/tronmongoose/toasted-clusters/issues"
+
+[tool.setuptools]
+py-modules = ["main", "transcribe", "audio", "wikilinks", "finance_guard"]
