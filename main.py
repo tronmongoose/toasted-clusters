@@ -82,20 +82,113 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     return 0
 
 
-# ── record from BlackHole ────────────────────────────────────────────
+# ── record from BlackHole (+ optional mic) ───────────────────────────
 
 
-def _capture(device: str, seconds: int) -> tuple[np.ndarray, int]:
+def _resolve_mic(explicit: str | None) -> str | int | None:
+    """Pick a mic device. Explicit arg > MIC_DEVICE env > sounddevice default > first
+    non-BlackHole input device. Returns None if nothing usable is found."""
     import sounddevice as sd
-    sr = DEFAULT_SAMPLE_RATE
-    print(f"Capturing {seconds}s from '{device}' at {sr} Hz…", file=sys.stderr)
-    buf = sd.rec(int(seconds * sr), samplerate=sr, channels=1, dtype="float32", device=device)
-    sd.wait()
-    return buf.reshape(-1), sr
+    if explicit:
+        return explicit
+    env = os.environ.get("MIC_DEVICE", "").strip()
+    if env:
+        return env
+    try:
+        default_in = sd.default.device[0]  # may be None or -1
+        if default_in is not None and default_in >= 0:
+            info = sd.query_devices(default_in)
+            if info["max_input_channels"] > 0 and "BlackHole" not in info["name"]:
+                return default_in
+    except (sd.PortAudioError, IndexError, TypeError):
+        pass
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and "BlackHole" not in d["name"]:
+            return i
+    return None
+
+
+def _capture_dual(
+    system_device: str,
+    mic_device: str | int | None,
+    seconds: int,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> tuple[np.ndarray, int]:
+    """Capture system audio and (optionally) the mic in parallel; mix to mono.
+
+    Two independent InputStreams write into preallocated float32 buffers via
+    callbacks, then we sum the buffers with 0.7x gain on each side so the
+    mix doesn't clip when both sides are loud. If `mic_device` is None we
+    skip mic capture and just return the system-audio buffer.
+    """
+    import sounddevice as sd
+
+    frames_total = int(seconds * sample_rate)
+    sys_buf = np.zeros(frames_total, dtype=np.float32)
+    mic_buf = np.zeros(frames_total, dtype=np.float32) if mic_device is not None else None
+    sys_idx = 0
+    mic_idx = 0
+
+    def _mono(block: np.ndarray) -> np.ndarray:
+        return block.mean(axis=1) if block.ndim > 1 and block.shape[1] > 1 else block.reshape(-1)
+
+    def sys_cb(indata, _frames, _time, _status):
+        nonlocal sys_idx
+        chunk = _mono(indata)
+        end = min(sys_idx + len(chunk), frames_total)
+        sys_buf[sys_idx:end] = chunk[: end - sys_idx]
+        sys_idx = end
+
+    def mic_cb(indata, _frames, _time, _status):
+        nonlocal mic_idx
+        chunk = _mono(indata)
+        end = min(mic_idx + len(chunk), frames_total)
+        mic_buf[mic_idx:end] = chunk[: end - mic_idx]
+        mic_idx = end
+
+    print(f"Capturing {seconds}s — system='{system_device}'"
+          + (f" + mic={mic_device!r}" if mic_device is not None else " (no mic)")
+          + f" at {sample_rate} Hz…", file=sys.stderr)
+
+    sys_stream = sd.InputStream(
+        device=system_device, channels=2, samplerate=sample_rate,
+        dtype="float32", callback=sys_cb,
+    )
+    streams = [sys_stream]
+    if mic_device is not None:
+        try:
+            mic_stream = sd.InputStream(
+                device=mic_device, channels=1, samplerate=sample_rate,
+                dtype="float32", callback=mic_cb,
+            )
+            streams.append(mic_stream)
+        except sd.PortAudioError as e:
+            print(f"  warning: mic capture failed ({e}); recording system audio only",
+                  file=sys.stderr)
+            mic_device = None
+            mic_buf = None
+
+    for s in streams:
+        s.start()
+    try:
+        sd.sleep(int(seconds * 1000))
+    finally:
+        for s in streams:
+            s.stop()
+            s.close()
+
+    if mic_buf is None:
+        return sys_buf, sample_rate
+    mixed = np.clip(sys_buf * 0.7 + mic_buf * 0.7, -1.0, 1.0).astype(np.float32)
+    return mixed, sample_rate
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    audio_buf, sr = _capture(args.device, args.seconds)
+    mic_device = None if args.no_mic else _resolve_mic(args.mic)
+    if mic_device is None and not args.no_mic:
+        print("  warning: no usable mic device found; recording system audio only",
+              file=sys.stderr)
+    audio_buf, sr = _capture_dual(args.device, mic_device, args.seconds)
     transcriber = get_transcriber()
     text = asyncio.run(transcriber.transcribe(audio_buf, sr))
 
@@ -204,10 +297,12 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--write", action="store_true", help="also write to the vault")
     t.set_defaults(fn=cmd_transcribe)
 
-    r = sub.add_parser("record", help="capture from BlackHole, transcribe, write to vault")
+    r = sub.add_parser("record", help="capture system audio + mic, transcribe, write to vault")
     r.add_argument("--seconds", type=int, default=30)
-    r.add_argument("--device", default=DEFAULT_DEVICE)
-    r.add_argument("--no-write", action="store_true", help="print transcript only")
+    r.add_argument("--device", default=DEFAULT_DEVICE, help="system audio loopback (default: BlackHole 2ch)")
+    r.add_argument("--mic", default=None, help="mic device (name or index). default: system default input")
+    r.add_argument("--no-mic", action="store_true", help="record system audio only; ignore the mic")
+    r.add_argument("--no-write", action="store_true", help="print transcript only; skip vault write")
     r.set_defaults(fn=cmd_record)
 
     args = p.parse_args(argv)

@@ -12,6 +12,62 @@
 
 ---
 
+## Quickstart
+
+Apple Silicon Mac, ~10 minutes. You'll be prompted for your password twice (BlackHole installer + audio daemon restart).
+
+```bash
+# 1. System packages
+brew install python@3.12 ffmpeg blackhole-2ch
+sudo killall coreaudiod          # makes BlackHole visible without rebooting
+
+# 2. Clone + venv + deps
+mkdir -p ~/projects && cd ~/projects
+git clone https://github.com/tronmongoose/toasted-clusters.git
+cd toasted-clusters
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 3. Configure
+cp .env.example .env
+# Edit .env: at minimum set OBSIDIAN_VAULT to your vault root (default ~/vault)
+
+# 4. Confirm audio plumbing
+python main.py devices
+# Expect: "BlackHole 2ch present: True"
+
+# 5. (One-time GUI) Open /Applications/Utilities/Audio MIDI Setup.app
+#    Create a Multi-Output Device bundling BlackHole 2ch + your speakers.
+#    Set Clock Source = BlackHole 2ch, enable Drift Correction on the speaker.
+#    Rename it (e.g. "Meeting Recording"). Right-click → Use For Sound Output.
+#    Full walkthrough in the "Setup" section below.
+
+# 6. Before a meeting: switch system output to your Multi-Output Device.
+#    Then start the recorder for the expected duration + a buffer:
+python main.py record --seconds 1800    # 30-minute capture
+# Output: $OBSIDIAN_VAULT/meetings/YYYY-MM-DD-meeting-HHMMSS.md
+# After the meeting: switch system output back to your normal speakers.
+```
+
+By default `record` captures **both sides**: system audio via BlackHole *and* your mic. First run downloads the ~3 GB Whisper model into `mlx_models/`.
+
+### Daily-use shell aliases (optional)
+
+```bash
+cat >> ~/.zshrc <<'EOF'
+
+# Toasted Clusters
+alias tc='source ~/projects/toasted-clusters/.venv/bin/activate && cd ~/projects/toasted-clusters && python main.py'
+alias tc-meet='source ~/projects/toasted-clusters/.venv/bin/activate && cd ~/projects/toasted-clusters && python main.py record --seconds'
+EOF
+source ~/.zshrc
+
+# Then: tc-meet 1800  →  30-minute meeting capture
+```
+
+---
+
 ## Why this exists
 
 Cloud meeting note-takers (Granola, Otter, Fireflies, Read.ai, etc.) are
@@ -50,38 +106,50 @@ didn't pick.
 ## How it works
 
 ```
-  System audio
-  ─────────────
-       │
-       ▼
-  ┌─────────────────────────┐         ┌─────────────────┐
-  │  BlackHole 2ch driver   │ ──────▶ │  Your speakers   │  ← you still hear it
-  │  (kernel audio loopback)│         └─────────────────┘
-  └─────────────────────────┘
-       │
-       ▼ (Multi-Output Device)
-  ┌─────────────────────────┐
-  │  sounddevice (Python)   │
-  │  → 16 kHz mono WAV      │
-  └─────────────────────────┘
-       │
-       ▼
-  ┌─────────────────────────┐
-  │  Whisper MLX (large-v3) │  ← 100% local. ~3 GB on first run.
-  │  5-min chunking for long│
-  │  audio (avoids loops)   │
-  └─────────────────────────┘
-       │
-       ▼
-  ┌─────────────────────────┐
-  │  finance_guard          │  → tags transcripts that mention money
-  │  wikilinks              │  → auto-links names from ~/vault/people/
-  └─────────────────────────┘
-       │
-       ▼
-  ~/vault/meetings/YYYY-MM-DD-meeting-HHMMSS.md
+  Meeting audio (Google Meet, Zoom, Teams, FaceTime, …)
+  ─────────────────────────────────────────────────────
+                       │
+                       ▼
+        ┌─────────────────────────┐          ┌──────────────┐
+        │   BlackHole 2ch driver   │ ───────▶ │ Your speakers│  ← you still hear it
+        │   (kernel audio loopback)│          └──────────────┘
+        └─────────────────────────┘
+                       │
+                       ▼  (Multi-Output Device routes to both)
+        ┌─────────────────────────┐
+        │  sounddevice — stream 1 │  ← what THEY say (system output)
+        └─────────────────────────┘
+                       │                    ┌─────────────────────────┐
+                       │     ┌─────────────▶│  sounddevice — stream 2 │  ← what YOU say (mic)
+                       │     │              └─────────────────────────┘
+                       ▼     ▼
+        ┌─────────────────────────────────┐
+        │  In-Python mixer (0.7x each)    │
+        │  → 16 kHz mono float32 buffer   │
+        └─────────────────────────────────┘
+                       │
+                       ▼
+        ┌─────────────────────────────────┐
+        │  Whisper MLX (large-v3)         │  100% local. ~3 GB on first run.
+        │  Auto-chunks 5 min pieces for   │
+        │  audio > 15 min                 │
+        └─────────────────────────────────┘
+                       │
+                       ▼
+        ┌─────────────────────────────────┐
+        │  finance_guard  → tags money    │
+        │  wikilinks      → links names   │
+        └─────────────────────────────────┘
+                       │
+                       ▼
+  $OBSIDIAN_VAULT/meetings/YYYY-MM-DD-meeting-HHMMSS.md
        (markdown + YAML frontmatter, ready for Obsidian)
 ```
+
+Two parallel `sounddevice` input streams run during a `record` invocation: one
+reads from BlackHole (system audio = the other participants), the other from
+your default mic (your side). They're mixed to a single mono buffer in Python,
+then fed to Whisper.
 
 ## Requirements
 
@@ -184,14 +252,24 @@ prevent Whisper's known "repetition loop" hallucination on long audio.
 
 ### `record`
 
-Capture N seconds from BlackHole 2ch, transcribe, and write to the vault. Use
-this for live meetings — start it just before the call.
+Capture N seconds from BlackHole 2ch (system audio) **and** your mic in
+parallel, mix them, transcribe, and write to the vault. Use this for live
+meetings — start it just before the call.
 
 ```bash
-python main.py record --seconds 1800                # 30-minute capture
-python main.py record --seconds 60 --no-write       # 60-second test, stdout only
-python main.py record --device "BlackHole 2ch"      # explicit device choice
+python main.py record --seconds 1800                # 30-min capture (system + mic)
+python main.py record --seconds 60 --no-write       # 60s test, stdout only
+python main.py record --mic "Razer Seiren V3 Mini"  # explicit mic device
+python main.py record --no-mic                      # system audio only
 ```
+
+Mic selection priority: `--mic` flag → `MIC_DEVICE` env var → macOS system
+default input → first input device that isn't BlackHole. If nothing usable is
+found, `record` falls back to system-audio-only with a stderr warning.
+
+The mix is 0.7× each side (clip-safe when both are loud). For Whisper this is
+fine; if you need separately-channeled output for diarization downstream, the
+mix point in `main.py:_capture_dual()` is the place to fork.
 
 ## Output format
 
@@ -270,6 +348,7 @@ All settings come from `.env` (or the process environment):
 | `OBSIDIAN_MEETINGS_SUBDIR` | `meetings` | Subdirectory under the vault |
 | `WHISPER_MODEL` | `large-v3` | Whisper model. Smaller = faster, lower quality |
 | `TRANSCRIBER_MODE` | `local` | `local` (Whisper MLX) or `cloud` (Deepgram) |
+| `MIC_DEVICE` | *(empty)* | Mic device for `record`. Empty = macOS default input |
 | `DEEPGRAM_API_KEY` | *(empty)* | Required only for `cloud` mode |
 
 ## Architecture & known limits
